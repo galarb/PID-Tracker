@@ -38,9 +38,9 @@ motorC = LargeMotor(OUTPUT_C) # Magnet
 # Here is where your code starts
 #change the Kp, Ki and Kd as you will, but make sure to comment the zieglernichols() in pidcalc function
 
-Kp = 1.15
-Ki = 3.9
-Kd = 0.004
+Kp = 1.8
+Ki = 0.0
+Kd = 0.06
 Ks = 0.000
 
 debugval = 2000 #the rateError value that triggeres the debuggin 
@@ -53,56 +53,54 @@ seconddev = 0
 rlF_pv = 0
 flag = False
 lastdev = 0
+delta_time = []
+start_time = time.time()
 error_debug = []
 pid_values_debug=[]
 rateError_debug =[]
+filtered_d_debug = []
+last_speedL = 0
+last_speedR = 0
+alpha = 0.3  # smoothing factor: 0.0 = no change, 1.0 = full new value
+
 definiteang =0
 cycle = 25#determin the Ti reset time
 elapsedTime = 0.02
-printflag = True # rue False
+printflag = False # True False
+filtered_d = 0  # filtered derivative
+accumTime = 0   # accumulated runtime in seconds
 
 # Describe this function...
 def pidcalc(sp, pv):
-    
-    global error, previousTime, cumError, lastError, rateError, lastdev, flag, seconddev, cycle  # Specify global variables
-    currentTime = time.time() * 1000             
-    elapsedTime = (currentTime - previousTime)/1000
-    #zieglernichols()
-    #print('elapsed time =', elapsedTime)
+    global error, previousTime, cumError, lastError, rateError, lastdev, flag
+    global seconddev, cycle, filtered_d, accumTime, alpha, last_speedL, last_speedR
+
+    currentTime = time.time() * 1000
+    elapsedTime = (currentTime - previousTime) / 1000
+
     error = sp - pv
     rateError = (error - lastError) / elapsedTime
-    seconddev = (rateError - lastdev) / elapsedTime
-    if not flag: #error is still accomulating, did not change direction yet
-        cumError += error * elapsedTime
-        
-    else: #error has changed direction
-        cumError = 0  # Reset cumulative error and rate error if elapsedTime is zero
-        #print("resetting Integral value")
-   
-    if printflag:
-        print('cumError,', int(cumError * Ki), ',rateError,', int(rateError) * Kd, ',seconddev,', int(seconddev), ',flag,', flag, end='')
 
-    out = Kp*error + Ki*cumError + Kd*rateError + Ks*seconddev
-    #print('Kp =', Kp, 'Ki =', Ki, 'Kd =', Kd)
+    # low-pass filter
+    
+    filtered_d = alpha * rateError + (1 - alpha) * filtered_d
+
+    # accumulate time
+    accumTime += elapsedTime
+
+    # PID output
+    out = Kp * error + Ki * cumError + Kd * filtered_d + Ks * seconddev
 
     previousTime = currentTime
-    #to find the flip point, where error changes direction. 
-    if (rateError < 2 and rateError > -2):
-        flag = True
-    else:
-        flag = False
-        #print('resetting flag')
-
-    lasterror = error
-    '''if abs(rateError) > debugval: 
-        debug(out, rateError, Ki, Kd)'''
-    
-    lastrlF_pv = rlF_pv
+    lastError = error
     lastdev = rateError
+
+    # logging
+    delta_time.append(accumTime)
     error_debug.append(error)
     rateError_debug.append(rateError)
+    filtered_d_debug.append(filtered_d)
 
-    #else: debug(0,0,0)
     return out
     
 def debug(out, rateError, Ki, Kd):
@@ -112,127 +110,57 @@ def debug(out, rateError, Ki, Kd):
         print('out =', out, 'rateError =', rateError, 'Ki =', Ki, 'Kd = ', Kd)
     pen_in5.down()
 
-def steer(ang_sp, speed, Kp):
-    print('steering')
-    ang_pv = gyro_sensor_in3.angle
-    delta = pidcalc(ang_sp, ang_pv)
-    speedR = speed - delta
-    speedL = speed + delta
-    if speedR > 100:
-        speedR = 100
-    if speedL > 100:
-        speedL = 100
-    if speedR < -100:
-        speedR = -100
-    if speedL < -100:
-        speedL = -100
-    #print("speedR =", speedR, "speeedL=", speedL)
-    #print("delta =", delta)
-    tank_drive.on(speedL, speedR)
-def findgap():
-    pass
 
-
-def zieglernichols():
-    global Kp, Ki, Kd, elapsedTime
-    Ku = 2.2#ultimate gain. where stable oscilations occur
-    Kp = 0.5*Ku
-    
-    #Tu - the cycle time of the oscilations, was measured between 18 and 19 itterations
-    Tu = 18*elapsedTime
-    Ti = 0.8*Tu
-    Td = 0.01*Tu
-    
-    Ki = Kp / Ti
-    Kd = Kp*Td
-    #print('Kp =', Kp, 'Ki =', Ki, 'Kd =', Kd)
-    
-    
 # track reflected_light_intensity. for how many itterations
 def track(speed, times):
-    reflected_light_sp = 50 #track mid line 
+    global last_speedL, last_speedR  # needed for filter state
+    
+    reflected_light_sp = 50  # track mid line
     for i in range(times):
         if ultrasonic_sensor_in2.distance_centimeters > 10:
-            rl_pv = color_sensor_in1.reflected_light_intensity # 100 = white, 0 = black
-            rl_pv_head = color_sensor_head.reflected_light_intensity
+            rl_pv = color_sensor_in1.reflected_light_intensity
 
-            delta = pidcalc(reflected_light_sp, rl_pv) #PID and a Ks for secondary deviation
-            if printflag:
-                print(',itteration number,', i, ',reflected light reading,', rl_pv, ',delta,', int(delta), end='')
+            # PID
+            delta = pidcalc(reflected_light_sp, rl_pv)
+
+            # stronger slowdown in corners
+            corner_factor = max(0.5, 1 - abs(delta)/40)
+            base_speed = speed * corner_factor
+
+            # nonlinear turn gain, capped
+            turn_gain = min((abs(delta)/40)**1.3, 0.8)
+            if delta > 0:  # turn left
+                speedR = base_speed
+                speedL = base_speed * (1 - 2 * turn_gain)  # can go negative if turn_gain > 0.5
+            elif delta < 0:  # turn right
+                speedL = base_speed
+                speedR = base_speed * (1 - 2 * turn_gain)
+            else:  # straight
+                speedR = base_speed
+                speedL = base_speed
             
-            if delta > 0 :
-                #print('going left')
-                speedR = speed + delta
-                speedL = speed 
-            elif delta < 0:
-                #print('going right')
-                speedR = speed 
-                speedL = speed + abs(delta)
-            else:
-                #print('going stright')
-                speedR = speed
-                speedL = speed
+
+            # clamp speeds
+            speedR = max(min(speedR, 100), -100)
+            speedL = max(min(speedL, 100), -100)
             
-            
-            if speedR > 100:
-                speedR = 100
-            if speedL > 100:
-                speedL = 100
-            if speedR < -100:
-                speedR = -100
-            if speedL < -100:
-                speedL = -100
-    
-            checkdirection(rl_pv)
+            # --- low-pass filter (corrected) ---
+            speedL = (1 - alpha) * speedL + alpha * last_speedL
+            speedR = (1 - alpha) * speedR + alpha * last_speedR
+            #if abs(delta) > 10:   # threshold → corner condition
+                #print(f"[corner] delta={delta:.2f}, speedL={speedL:.2f}, speedR={speedR:.2f}")
+            last_speedL = speedL
+            last_speedR = speedR
+
             tank_drive.on(speedL, speedR)
+
             if printflag:
                 print(',speedR,', int(speedR), ',speedL,', int(speedL))
         else: 
-            avoidobstacle(40, 200) #speed, times
+            avoidobstacle(40, 200)  # speed, times
 
-def avoidobstacle(speed, times):
-    turn(90, 40, 1)
-    for i in range(times):
-       steer(90, speed, 1) 
-    turn(0, 40, 1)
-    for i in range(1.4*times):
-       steer(0, speed, 1) 
-    turn(-90, 40, 1)
-    for i in range(times):
-       steer(-90, speed, 1) 
-    turn(0, 40, 1)
-    tank_drive.on(25,25)   
-
-def checkdirection(rl_pv):
-    ang_pv = gyro_sensor_in3.angle
-
-    if(ang_pv > 360):
-        turn (0, 20, 1)
-        steer(0, 20, 1)
-
-        
-
-def turn(ang_sp, times, Kp):
-    #print ("turning to ", ang_sp)
-    for i in range(times):
-        ang_pv = gyro_sensor_in3.angle
-        speedR = -pidcalc(ang_sp, ang_pv)
-        speedL = -speedR
-       
-        if speedR > 100:
-            speedR = 100
-        elif speedR < -100:
-            speedR = -100
-        if speedL > 100:
-            speedL = 100
-        elif speedL < -100:
-            speedL = -100
-        tank_drive.on(speedL, speedR)
-        # Update ang_pv within the loop
-        ang_pv = gyro_sensor_in3.angle
-    #print("finished turning", ang_pv)
-
-gyro_sensor_in3.reset()
-track(30, 100)#default speed, how many iterations
-
+track(50, 2000)#default speed, how many iterations
+print("time,error,rateError")
+#for t, e, r in zip(delta_time, error_debug, rateError_debug):
+    #print(f"{t:.3f},{e:.3f},{r:.3f}")
 tank_drive.off(brake=True)
